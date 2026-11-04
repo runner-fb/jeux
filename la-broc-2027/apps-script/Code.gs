@@ -9,12 +9,7 @@ function doGet(e) {
 // Le suffixe _ rend cette fonction inaccessible depuis google.script.run.
 function initialiser_() {
   const props=PropertiesService.getScriptProperties();
-  if (!props.getProperty('LEDGER_ID')) {
-    const ss=SpreadsheetApp.create('La Broc 2027 — Inscriptions site');
-    const sheet=ss.getSheets()[0];sheet.setName('Inscriptions');sheet.appendRow(HEADERS);sheet.setFrozenRows(1);
-    DriveApp.getFileById(ss.getId()).moveTo(DriveApp.getFolderById(ROOT_FOLDER_ID));
-    props.setProperty('LEDGER_ID',ss.getId());
-  }
+  if (!props.getProperty('LEDGER_ID')) throw Error('Configurez le fichier de suivi existant dans LEDGER_ID.');
   const defaults={INITIAL_REMAINING:'2',PRICE:'6',MAX_TABLES:'2',OPEN:'false',CARD_URL:'',TRANSFER_INSTRUCTIONS:'',OFFLINE_INSTRUCTIONS:'Paiement par chèque ou espèces auprès de l’association Jeux k’Ifs.'};
   Object.keys(defaults).forEach(k=>{if(props.getProperty(k)===null)props.setProperty(k,defaults[k])});
 }
@@ -53,7 +48,7 @@ function submit_(payload,isTest){
  if(data.payment==='card'&&!paymentUrl_(data,c))throw Error('Paiement par carte indisponible pour ce nombre de tables.');
  if(data.payment==='transfer'&&!c.transferInstructions)throw Error('Le virement n’est pas disponible.');
  const sheet=ledger_(c);const rows=sheet.getDataRange().getValues();let index=rows.findIndex(r=>r[0]===data.id),row=index+1,record=index>=1?rows[index]:null;const digest=fingerprint_(data);
- if(record){let stored=JSON.parse(record[11]);if(stored.fingerprint!==digest)throw Error('Cette référence est déjà utilisée. Rechargez le formulaire.');if(record[2]==='ANNULEE')throw Error('Cette inscription a été annulée.');if(record[2]==='ENREGISTREE')return response_(data,c,record[10]==='ENVOYE');}
+ if(record){let stored=JSON.parse(record[11]);if(stored.fingerprint!==digest)throw Error('Cette référence est déjà utilisée. Rechargez le formulaire.');if(record[2]==='ANNULEE')throw Error('Cette inscription a été annulée.');if(record[2]==='ENREGISTREE'){if(!isTest)syncResponse_(c,record);return response_(data,c,record[10]==='ENVOYE');}}
  if(!record){if(!c.open)throw Error('Les inscriptions sont fermées.');if(data.tables>remaining_(sheet,c))throw Error('Le nombre de tables disponibles a changé. Rechargez le formulaire.');
  row=sheet.getLastRow()+1;const stored={rules:c.rules,price:c.price,fingerprint:digest,people:data.people,organisation:data.organisation,kind:data.kind,accepted:true,rulesVersion:'2027-01-dates-corrigees'};
  sheet.appendRow([data.id,new Date(),'EN_COURS',data.tables,data.tables*c.price,safeCell_(data.people[0].First+' '+data.people[0].Last),safeCell_(data.people[0].Email),data.payment,'','','A_ENVOYER',JSON.stringify(stored)]);SpreadsheetApp.flush();record=sheet.getRange(row,1,1,12).getValues()[0];}
@@ -61,6 +56,7 @@ function submit_(payload,isTest){
  let folder;if(record[8])folder=DriveApp.getFolderById(record[8]);else{folder=DriveApp.getFolderById(ROOT_FOLDER_ID).createFolder(data.people[0].First+' '+data.people[0].Last+' — '+data.id.slice(0,8));sheet.getRange(row,9).setValue(folder.getId());SpreadsheetApp.flush();}
  for(const file of data.files){if(!folder.getFilesByName(file.blob.getName()).hasNext())folder.createFile(file.blob);}
  let pdf;if(record[9])pdf=DriveApp.getFileById(record[9]);else{const existing=folder.getFilesByName('Acceptation-reglement.pdf');pdf=existing.hasNext()?existing.next():pdf_(data,folder,record[1],Number(record[4]));sheet.getRange(row,10).setValue(pdf.getId());}
+ if(!isTest)syncResponse_(c,sheet.getRange(row,1,1,12).getValues()[0]);
  sheet.getRange(row,3).setValue('ENREGISTREE');SpreadsheetApp.flush();
  // Un échec d’envoi ne transforme jamais une inscription enregistrée en échec de réservation.
  let sent=false;try{if(MailApp.getRemainingDailyQuota()>0){sheet.getRange(row,11).setValue('ENVOI_EN_COURS');SpreadsheetApp.flush();MailApp.sendEmail({to:data.people[0].Email,subject:(data.test?"[TEST] ":"")+c.emailSubject,name:'Jeux k’Ifs',body:emailText_(data,c),htmlBody:emailHtml_(data,c),attachments:[pdf.getBlob()]});sent=true;sheet.getRange(row,11).setValue('ENVOYE');}}catch(error){sheet.getRange(row,11).setValue('A_VERIFIER');}
@@ -90,3 +86,28 @@ function adminSaveSettings(token,payload){requireAdmin_(token);if(!payload||!pay
 
 function readSettings_(p){if(!p.FORM_PARTS)return JSON.parse(p.FORM_SETTINGS||'{}');let json='';for(let i=0;i<Number(p.FORM_PARTS);i++)json+=p['FORM_PART_'+i]||'';return JSON.parse(json);}
 function writeSettings_(p,value){const json=JSON.stringify(value);let i=0;for(let n=0;n<json.length;n+=2000)p.setProperty('FORM_PART_'+(i++),json.slice(n,n+2000));p.setProperty('FORM_PARTS',String(i));}
+
+// Le suivi visible et le journal technique sont dans le même classeur.
+// La référence unique évite les doublons lors d'une reprise après interruption.
+function responseValues_(record,files){
+ const d=JSON.parse(record[11]),p=d.people[0],q=d.people[1]||{},o=d.organisation||{};
+ const street=x=>[x.Street,x.Extra,x.Region].filter(Boolean).join(', ');
+ const values=["Je ne suis pas un professionnel",d.rules,"J'ai lu et j'accepte le règlement de La Broc",d.kind,
+ o.orgName||'',o.orgStreet||'',[o.orgExtra,o.orgRegion].filter(Boolean).join(', '),o.orgCity||'',o.orgZip||'',o.orgRole||'',
+ p.First,p.Last,p.Phone,p.Email,street(p),p.City,p.Zip,d.people.length>1?'Ajouter un participant à la même table':'',
+ q.First||'',q.Last||'',q.Phone||'',q.Email||'',street(q),q.City||'',q.Zip||'',
+ files.identity1||'',files.attestation1||'',files.identity2||'',files.attestation2||'',Number(record[3]),paymentLabel_(record[7]),record[0]];
+ return values.map(v=>typeof v==='number'?v:safeCell_(v==null?'':v));
+}
+function syncResponse_(c,record){
+ const target=SpreadsheetApp.openById(c.ledger).getSheetByName('Form responses');
+ if(!target||target.getRange(1,32).getValue()!=='Submission ID')throw Error('Le tableau de soumissions doit être vérifié par l’association.');
+ const last=target.getLastRow();
+ if(last>1&&target.getRange(2,32,last-1,1).getValues().some(r=>String(r[0])===String(record[0])))return;
+ const files={},folder=DriveApp.getFolderById(record[8]),it=folder.getFiles();
+ while(it.hasNext()){const f=it.next(),key=f.getName().replace(/\.[^.]+$/,'');if(['identity1','attestation1','identity2','attestation2'].includes(key))files[key]=f.getUrl();}
+ const row=last+1;if(row>target.getMaxRows())target.insertRowsAfter(target.getMaxRows(),1);
+ if(last>1)target.getRange(last,1,1,32).copyTo(target.getRange(row,1,1,32),SpreadsheetApp.CopyPasteType.PASTE_FORMAT,false);
+ target.getRange(row,1,1,32).setValues([responseValues_(record,files)]);
+ SpreadsheetApp.flush();
+}
